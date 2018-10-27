@@ -1,0 +1,11 @@
+resolver: lts-12.14
+
+packages:
+- .
+
+extra-deps:
+- serialise-0.2.1.0
+- haskell-lsp-0.8.0.0
+- haskell-lsp-types-0.8.0.0
+- git: https://github.com/haskell-nix/hnix.git
+  commit: a34dddb66932b415ab837249fdad13ff910db242
