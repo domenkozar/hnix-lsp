@@ -49,13 +49,13 @@ commandLineOptionsParser = CommandLineOptions
        ( long "server-log-file"
        <> metavar "FILENAME"
        <> help "Log file used for general server logging"
-       <> value ("/tmp/hnix-lsp.log")
+       <> value "/tmp/hnix-lsp.log"
        )
    <*> strOption
        ( long "session-log-file"
        <> metavar "FILENAME"
        <> help "Log file used for general server logging"
-       <> value ("/tmp/hnix-lsp.log")
+       <> value "/tmp/hnix-lsp.log"
        )
 
 commandLineOptions :: ProcessID -> ParserInfo CommandLineOptions
