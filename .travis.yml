@@ -1,0 +1,18 @@
+os:
+  - linux
+  - osx
+language: nix
+sudo: required
+
+before_script:
+  - sudo mount -o remount,exec,size=4G,mode=755 /run/user || true
+  - sudo mkdir -p /etc/nix
+  - echo "trusted-users = root $USER" | sudo tee -a /etc/nix/nix.conf
+  - sudo launchctl kickstart -k system/org.nixos.nix-daemon || true
+
+script:
+  - nix-build -j2
+  #- nix-env -iA cachix -f https://github.com/NixOS/nixpkgs/tarball/889c72032f8595fcd7542c6032c208f6b8033db6
+  #- cachix use hnix-lsp
+  #- if [ ! "$CACHIX_SIGNING_KEY" = "" ]; then cachix push hnix-lsp --watch-store& fi
+  #- if [ ! "$CACHIX_SIGNING_KEY" = "" ]; then ./build.sh | cachix push hnix-lsp; else ./build.sh; fi
