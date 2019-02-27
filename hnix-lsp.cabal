@@ -32,7 +32,6 @@ library
                      , mtl
                      , lens
                      , stm
-                     , unix
                      , protolude
                      , ansi-wl-pprint
                      , text

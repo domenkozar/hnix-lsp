@@ -12,8 +12,6 @@ import Control.Lens
 import Control.Monad.IO.Class
 import Control.Monad.Reader
 import Control.Monad.STM
-import System.Posix.Process
-import System.Posix.Types
 import Data.Maybe
 import Data.Default
 import Data.Semigroup
@@ -37,29 +35,20 @@ import Options.Applicative
 import Protolude hiding (sourceLine, sourceColumn)
 
 
-data CommandLineOptions
-   = CommandLineOptions
-   { serverLogFile :: FilePath
-   , sessionLogFile :: FilePath
+data CommandLineOptions = CommandLineOptions
+   { verbose :: Bool
    }
 
 commandLineOptionsParser :: Parser CommandLineOptions
 commandLineOptionsParser = CommandLineOptions
-   <$> strOption
-       ( long "server-log-file"
-       <> metavar "FILENAME"
-       <> help "Log file used for general server logging"
-       <> value "/tmp/hnix-lsp.log"
-       )
-   <*> strOption
-       ( long "session-log-file"
-       <> metavar "FILENAME"
-       <> help "Log file used for general server logging"
-       <> value "/tmp/hnix-lsp.log"
+   <$> switch
+       ( long "verbose"
+       <> short 'v'
+       <> help "Debug logging"
        )
 
-commandLineOptions :: ProcessID -> ParserInfo CommandLineOptions
-commandLineOptions _ = info (commandLineOptionsParser <**> helper)
+commandLineOptions :: ParserInfo CommandLineOptions
+commandLineOptions = info (commandLineOptionsParser <**> helper)
    ( fullDesc
    <> header "hnix-lsp"
    <> progDesc "A Language Server Protocol Implementation for the Nix Language (see https://nixos.org/nix/)"
@@ -67,32 +56,57 @@ commandLineOptions _ = info (commandLineOptionsParser <**> helper)
 
 main :: IO ()
 main = do
- opts <- execParser =<< commandLineOptions <$> getProcessID
- exitcode <- run opts (return ())
+ opts <- execParser commandLineOptions
+ exitcode <- run opts
  case exitcode of
    0 -> exitSuccess
    c -> exitWith . ExitFailure $ c
 
-run :: CommandLineOptions -> IO () -> IO Int
-run opts dispatcherProc = flip Exception.catches handlers $ do
+run :: CommandLineOptions -> IO Int
+run _ = flip Exception.catches handlers $ do
    rin <- atomically newTChan :: IO (TChan ReactorInput)
    let dp lf = do
-           _rpid <- forkIO $ reactor lf rin
-           dispatcherProc
-           return Nothing
+         _rpid <- forkIO $ reactor lf rin
+         return Nothing
    flip Exception.finally L.removeAllHandlers $ do
-       LSP.Core.setupLogger (Just (serverLogFile opts)) [] L.DEBUG
+       LSP.Core.setupLogger Nothing [] L.DEBUG
        LSP.Control.run
            (return (Right ()), dp)
            (lspHandlers rin)
            lspOptions
-           (Just (sessionLogFile opts))
+           Nothing
  where
    handlers =
      [ Exception.Handler ioExcept
      , Exception.Handler someExcept]
    ioExcept (e :: Exception.IOException) = print e >> return 1
    someExcept (e :: Exception.SomeException) = print e >> return 1
+
+
+   lspOptions :: LSP.Core.Options
+   lspOptions = def
+     { LSP.Core.textDocumentSync = Just syncOptions }
+
+   syncOptions :: LSP.TextDocumentSyncOptions
+   syncOptions = LSP.TextDocumentSyncOptions
+      { LSP._openClose = Just True
+      , LSP._change = Just LSP.TdSyncNone
+      , LSP._willSave = Just False
+      , LSP._willSaveWaitUntil = Just False
+      , LSP._save = Just $ LSP.SaveOptions $ Just True
+      }
+
+   lspHandlers :: TChan ReactorInput -> LSP.Core.Handlers
+   lspHandlers rin = def
+      { LSP.Core.initializedHandler = Just $ passHandler NotInitialized
+      , LSP.Core.didSaveTextDocumentNotificationHandler = Just $ passHandler NotDidSaveTextDocument
+      , LSP.Core.didOpenTextDocumentNotificationHandler = Just $ passHandler NotDidOpenTextDocument
+      , LSP.Core.documentFormattingHandler = Just $ passHandler ReqDocumentFormatting
+      }
+     where
+       passHandler :: (a -> FromClientMessage) -> LSP.Core.Handler a
+       passHandler c notification =
+         atomically $ writeTChan rin (HandlerRequest (c notification))
 
 -- The reactor is a process that serialises and buffers all requests from the
 -- LSP client, so they can be sent to the backend compiler one at a time, and a
@@ -111,48 +125,53 @@ reactor lf inp =
    flip runReaderT lf $ forever $ do
        inval <- liftIO $ atomically $ readTChan inp
        case inval of
-           HandlerRequest (RspFromClient rm) ->
-               liftIO $ LSP.logs $ "reactor:got RspFromClient:" ++ show rm
-
            HandlerRequest (NotInitialized _) ->
-               return ()
+             return ()
 
-           HandlerRequest (NotDidSaveTextDocument notification) -> do
-               liftIO $ LSP.Core.flushDiagnosticsBySourceFunc lf 200 (Just "hnix")
-               return ()
+           HandlerRequest (NotDidSaveTextDocument req) -> do
+             liftIO $ LSP.Core.flushDiagnosticsBySourceFunc lf 200 (Just "hnix")
+             parseWithDiagnostics (reqToURI req) (\_ -> return ())
+
+           HandlerRequest (NotDidOpenTextDocument req) ->
+             parseWithDiagnostics (reqToURI req) (\_ -> return ())
 
            -- TODO: range, type
-           HandlerRequest (ReqDocumentFormatting req) -> do
-            let uri = reqToURI req
-                Just fp = LSP.uriToFilePath uri
-            liftIO $ LSP.logs $ "reactor: formatting on " <> fp
-            txt <- liftIO $ readFile fp
-            case parse Nix.Parser.nixToplevelForm fp txt of
-              Left err -> do
-                let [pos] = NonEmpty.toList (errorPos err)
-                    position = LSP.Position (unPos (sourceLine pos)) (unPos (sourceColumn pos))
-                    diag = LSP.Diagnostic
-                            (LSP.Range position position)
-                            (Just LSP.DsError)  -- severity
-                            Nothing  -- code
-                            (Just "hnix") -- source
-                            (toS (parseErrorTextPretty err))
-                            (Just (LSP.List []))
-                liftIO $ LSP.Core.publishDiagnosticsFunc lf 100 uri (Just 0) (partitionBySource [diag])
-                return ()
-              Right expr -> do
-                -- TODO: get pretty printing options from request
-                let out = displayS (renderPretty 0.4 80 (Nix.Pretty.prettyNix (Nix.Expr.stripAnnotation expr))) ""
-                    range = LSP.Range (LSP.Position 0 0) (LSP.Position (length (T.lines txt)) 0)
-                    resp = LSP.List [LSP.TextEdit range (toS out)]
-                reactorSend $ RspDocumentFormatting $ LSP.Core.makeResponseMessage req resp
+           HandlerRequest (ReqDocumentFormatting req) ->
+             parseWithDiagnostics (reqToURI req) $ \(expr, txt) -> do
+              -- TODO: get pretty printing options from request
+              let out = displayS (renderPretty 0.4 80 (Nix.Pretty.prettyNix (Nix.Expr.stripAnnotation expr))) ""
+                  range = LSP.Range (LSP.Position 0 0)
+                                    (LSP.Position (length (T.lines txt)) 0)
+                  resp = LSP.List [LSP.TextEdit range (toS out)]
+              reactorSend $ RspDocumentFormatting $ LSP.Core.makeResponseMessage req resp
 
            HandlerRequest req ->
              liftIO $ LSP.logs $ "reactor: unhandled HandlerRequest:" ++ show req
 
-reqToURI :: (LSP.HasParams s a1, LSP.HasTextDocument a1 a2,
-             LSP.HasUri a2 a3)
-             => s -> a3
+parseWithDiagnostics :: LSP.Uri -> ((Nix.Expr.NExprLoc, Text) -> R () ()) -> R () ()
+parseWithDiagnostics uri f = do
+  lf <- ask
+  let Just fp = LSP.uriToFilePath uri
+  txt <- liftIO $ readFile fp
+  case parse Nix.Parser.nixToplevelForm fp txt of
+    Left err -> do
+      let [pos] = NonEmpty.toList (errorPos err)
+          position = LSP.Position (unPos (sourceLine pos)) (unPos (sourceColumn pos))
+          diag = LSP.Diagnostic
+                  (LSP.Range position position)
+                  (Just LSP.DsError)  -- severity
+                  Nothing  -- code
+                  (Just "hnix") -- source
+                  (toS (parseErrorTextPretty err))
+                  (Just (LSP.List []))
+      liftIO $ LSP.logs $ show diag
+      liftIO $ LSP.Core.publishDiagnosticsFunc lf 100 uri (Just 0) (partitionBySource [diag])
+    Right expr -> f (expr, txt)
+
+reqToURI :: ( LSP.HasParams s a1
+            , LSP.HasTextDocument a1 a2
+            , LSP.HasUri a2 a3
+            ) => s -> a3
 reqToURI req =
     req ^.
     LSP.params .
@@ -163,27 +182,3 @@ reactorSend :: FromServerMessage -> R () ()
 reactorSend msg = do
   lf <- ask
   liftIO $ LSP.Core.sendFunc lf msg
-
-lspOptions :: LSP.Core.Options
-lspOptions = def
-  { LSP.Core.textDocumentSync = Just syncOptions }
-  where
-    syncOptions :: LSP.TextDocumentSyncOptions
-    syncOptions = LSP.TextDocumentSyncOptions
-       { LSP._openClose = Just False
-       , LSP._change = Just LSP.TdSyncNone
-       , LSP._willSave = Just False
-       , LSP._willSaveWaitUntil = Just False
-       , LSP._save = Just $ LSP.SaveOptions $ Just False
-       }
-
-lspHandlers :: TChan ReactorInput -> LSP.Core.Handlers
-lspHandlers rin = def
-   { LSP.Core.initializedHandler = Just $ passHandler NotInitialized
-   , LSP.Core.didSaveTextDocumentNotificationHandler = Just $ passHandler NotDidSaveTextDocument
-   , LSP.Core.documentFormattingHandler = Just $ passHandler ReqDocumentFormatting
-   }
-   where
-     passHandler :: (a -> FromClientMessage) -> LSP.Core.Handler a
-     passHandler c notification =
-       atomically $ writeTChan rin (HandlerRequest (c notification))
