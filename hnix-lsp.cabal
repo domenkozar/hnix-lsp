@@ -34,7 +34,7 @@ library
                      , stm
                      , unix
                      , protolude
-                     , ansi-wl-pprint
+                     , prettyprinter
                      , text
   exposed-modules:
     Nix.LSP

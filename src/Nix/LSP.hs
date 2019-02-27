@@ -29,8 +29,9 @@ import qualified Language.Haskell.LSP.Utility as LSP
 import qualified Nix.Expr
 import qualified Nix.Parser
 import qualified Nix.Pretty
-import Text.Megaparsec (errorPos, parse, SourcePos(..), unPos, parseErrorTextPretty)
-import Text.PrettyPrint.ANSI.Leijen (renderPretty, displayS)
+import Text.Megaparsec (parse, attachSourcePos, ParseErrorBundle(..), errorOffset, SourcePos(..), unPos, parseErrorTextPretty)
+import Data.Text.Prettyprint.Doc as Doc
+import Data.Text.Prettyprint.Doc.Render.String as Doc
 import System.Exit
 import qualified System.Log.Logger as L
 import Options.Applicative
@@ -128,23 +129,26 @@ reactor lf inp =
             liftIO $ LSP.logs $ "reactor: formatting on " <> fp
             txt <- liftIO $ readFile fp
             case parse Nix.Parser.nixToplevelForm fp txt of
-              Left err -> do
-                let [pos] = NonEmpty.toList (errorPos err)
-                    position = LSP.Position (unPos (sourceLine pos)) (unPos (sourceColumn pos))
-                    diag = LSP.Diagnostic
-                            (LSP.Range position position)
-                            (Just LSP.DsError)  -- severity
-                            Nothing  -- code
-                            (Just "hnix") -- source
-                            (toS (parseErrorTextPretty err))
-                            (Just (LSP.List []))
-                liftIO $ LSP.Core.publishDiagnosticsFunc lf 100 uri (Just 0) (partitionBySource [diag])
+              Left bundle -> do
+                let (sourceposes, _) = attachSourcePos errorOffset (bundleErrors bundle) (bundlePosState bundle)
+
+                    diag (err, pos) =
+                      let
+                        position = LSP.Position (unPos (sourceLine pos)) (unPos (sourceColumn pos))
+                      in LSP.Diagnostic
+                          (LSP.Range position position)
+                          (Just LSP.DsError)  -- severity
+                          Nothing  -- code
+                          (Just "hnix") -- source
+                          (toS (parseErrorTextPretty err))
+                          (Just (LSP.List []))
+                liftIO $ LSP.Core.publishDiagnosticsFunc lf 100 uri (Just 0) (partitionBySource (map diag (NonEmpty.toList sourceposes)))
                 return ()
               Right expr -> do
                 -- TODO: get pretty printing options from request
-                let out = displayS (renderPretty 0.4 80 (Nix.Pretty.prettyNix (Nix.Expr.stripAnnotation expr))) ""
+                let out = Doc.layoutPretty (Doc.LayoutOptions (Doc.AvailablePerLine 80 0.4)) (Nix.Pretty.prettyNix (Nix.Expr.stripAnnotation expr))
                     range = LSP.Range (LSP.Position 0 0) (LSP.Position (length (T.lines txt)) 0)
-                    resp = LSP.List [LSP.TextEdit range (toS out)]
+                    resp = LSP.List [LSP.TextEdit range (toS (Doc.renderString out))]
                 reactorSend $ RspDocumentFormatting $ LSP.Core.makeResponseMessage req resp
 
            HandlerRequest req ->
