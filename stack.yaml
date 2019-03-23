@@ -1,11 +1,12 @@
-resolver: lts-12.14
+resolver: lts-13.9
 
 packages:
 - .
 
 extra-deps:
-- serialise-0.2.1.0
-- haskell-lsp-0.8.0.0
-- haskell-lsp-types-0.8.0.0
+- hashing-0.1.0.1
+- monadlist-0.0.2
+- ref-tf-0.4.0.1
+- hnix-store-core-0.1.0.0
 - git: https://github.com/haskell-nix/hnix.git
-  commit: a34dddb66932b415ab837249fdad13ff910db242
+  commit: e7df5e1bd9ae91ab103605ce21d5d71309346326
